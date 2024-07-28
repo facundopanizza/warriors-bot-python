@@ -7,6 +7,7 @@ from ppadb.client import Client as AdbClient
 from utils.wait import wait
 from utils.get_image_path import get_image_path
 from datetime import datetime
+import threading
 # from PIL import Image
 
 class GameAutomation:
@@ -52,7 +53,6 @@ class GameAutomation:
                 elif key == 'q':
                     sys.exit(0)
 
-        import threading
         threading.Thread(target=key_handler, daemon=True).start()
 
     def screenshot(self):
@@ -64,17 +64,19 @@ class GameAutomation:
             f.write(image)
 
     def analyze_image(self, image_name, refresh_image=False):
+        print(self.current_image_loop, self.loop_count, refresh_image)
         if refresh_image or self.current_image_loop is None or self.current_image_loop != self.loop_count:
             self.screenshot()
             self.current_image_loop = self.loop_count
 
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{current_time}] Analyzing image {image_name}")
 
         mat = cv.imread('./screencap.png')
         template = cv.imread(get_image_path(image_name))
         result = cv.matchTemplate(mat, template, cv.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv.minMaxLoc(result)
+
+        print(f"[{current_time}] Analyzing image {image_name} - {max_val}")
 
         match_threshold = 0.7
         if max_val < match_threshold:
@@ -109,8 +111,7 @@ class GameAutomation:
         self.create_first_unit()
 
         if self.is_in_battle_count >= 100:
-            self.screenshot()
-            close_battle_button = self.analyze_image('close-battle-button.png')
+            close_battle_button = self.analyze_image('close-battle-button.png', True)
             self.is_in_battle = self.check_if_is_in_battle()
 
             if close_battle_button:
@@ -122,9 +123,9 @@ class GameAutomation:
     def exit_battle(self, close_battle_button):
         while not self.check_if_is_on_menu():
             self.touch_screen(close_battle_button['x'], close_battle_button['y'])
-            wait(500)
+            wait(800)
 
-        stuck_button = self.analyze_image('are-you-stuck-button.png')
+        stuck_button = self.analyze_image('are-you-stuck-button.png', True)
         if stuck_button:
             self.touch_screen(stuck_button['x'], stuck_button['y'])
 
@@ -138,15 +139,23 @@ class GameAutomation:
     def upgrade_and_start_battle(self):
         if self.should_upgrade_production:
             self.touch_screen(self.upgrade_menu['x'], self.upgrade_menu['y'])
-            wait(400)
+
+            wait(600)
             self.device.shell(f"input touchscreen swipe {self.upgrade_production['x']} {self.upgrade_production['y']} {self.upgrade_production['x']} {self.upgrade_production['y']} 3000")
-            wait(400)
+            wait(600)
 
         self.touch_screen(self.battle_menu['x'], self.battle_menu['y'])
         self.screenshot()
         battle_button = self.analyze_image('start-battle-button.png', True)
+        battle_brown_button = self.analyze_image('start-battle-brown-button.png', True)
+        print(battle_button)
+        print("battle button top")
 
-        if battle_button:
+        if battle_brown_button:
+            while not self.is_in_battle:
+                self.touch_screen(battle_brown_button['x'], battle_brown_button['y'])
+                self.is_in_battle = self.check_if_is_in_battle()
+        elif battle_button:
             while not self.is_in_battle:
                 self.touch_screen(battle_button['x'], battle_button['y'])
                 self.is_in_battle = self.check_if_is_in_battle()
@@ -169,8 +178,9 @@ class GameAutomation:
         while True:
             # self.read_number_from_screen(region=(822, 1273, 992, 1333))
             if self.pause:
-                wait(100)
                 continue
+
+            self.loop_count += 1
 
             if self.loop_count > 10000:
                 end_time = time.time()
@@ -182,15 +192,15 @@ class GameAutomation:
                 continue
 
             is_on_menu = self.check_if_is_on_menu()
+
             if is_on_menu:
                 self.handle_menu_state()
             else:
                 self.is_in_battle = True
-                stuck_button = self.analyze_image('are-you-stuck-button.png')
+                stuck_button = self.analyze_image('are-you-stuck-button.png', True)
                 if stuck_button:
                     self.touch_screen(stuck_button['x'], stuck_button['y'])
 
-            self.loop_count += 1
 
 if __name__ == "__main__":
     try:
