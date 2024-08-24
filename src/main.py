@@ -7,7 +7,13 @@ from ppadb.client import Client as AdbClient
 from utils.get_image_path import get_image_path
 from datetime import datetime, timedelta
 import threading
-from PIL import Image
+from PIL import Image, ImageEnhance
+import numpy as np
+import curses
+import re
+import cv2
+import logging
+import msvcrt
 
 class GameAutomation:
     def __init__(self, unit_to_create=2, should_upgrade_production=True):
@@ -22,9 +28,15 @@ class GameAutomation:
         self.stuck_threshold = 0.95
         self.min_stuck_screenshots = 50
         self.running = True
-        self.gold_won_on_battle = 0
+        self.gold_won_on_last_battle = 0
         self.gold_held = 0
         self.gold_cost_of_next_upgrade = 0
+        self.evolve_amount = 0
+        self.key_handler_thread = None
+        self.screenshot_thread = None
+        self.debug = False
+        self.setup_logging()
+        self.is_saving_to_evolve = False
 
         self.unit_to_create = unit_to_create
 
@@ -35,65 +47,200 @@ class GameAutomation:
         self.upgrade_menu = {'x': 330, 'y': 2178}
         self.upgrade_production = {'x': 852, 'y': 1307}
         self.battle_menu = {'x': 543, 'y': 2178}
+
+        self.third_skill_coords = {'x': 570, 'y': 1750}
         self.second_skill_coords = {'x': 950, 'y': 1750}
         self.first_skill_coords = {'x': 750, 'y': 1750}
+
+        self.hero_coords = {'x': 130, 'y': 1750}
+
         self.evolution_tab_button = {'x': 663, 'y': 1900}
         self.upgrade_tab_button = {'x': 400, 'y': 1900}
         self.evolve_button = {'x': 550, 'y': 1425}
         self.enter_event_button = {'x': 500, 'y': 1500}
 
         self.gold_region = (80, 7, 300, 70)
-        self.cost_of_production_region = (800, 1245, 980, 1330)
-        self.gold_won_on_battle_region = (360, 1024, 800, 1125)
-
+        self.cost_of_production_region = (800, 1245, 980, 1300)
+        self.gold_won_on_battle_region = (360, 1000, 800, 1125)
+        self.evolve_amount_region = (370, 1450, 700, 1530)
 
         self.time_of_start_of_battle = None
         self.start_to_create_units = False
 
         self.start_time = datetime.now()
 
+        self.menu_items = [
+            ("Upgrade Production: ON", self.toggle_upgrade_production),
+            ("Debug Mode: OFF", self.toggle_debug),
+            ("Pause/Resume: Running", self.toggle_pause),
+            ("Debug Number Reading", self.debug_number_reading),
+            ("Quit", self.quit_program)
+        ]
+        self.selected_menu_item = 0
+        self.screen = None
+
     def initialize(self):
         devices = self.client.devices()
         if len(devices) == 0:
-            print("No devices connected")
+            self.debug_print("No devices connected")
             return False
 
         self.device = devices[0]
         self.setup_pause_handler()
         self.is_in_battle = self.check_if_is_in_battle()
-        threading.Thread(target=self.screenshot_loop, daemon=True).start()
+        self.screenshot_thread = threading.Thread(target=self.screenshot_loop, daemon=True)
+        self.screenshot_thread.start()
 
-        print("Bot started")
+        self.screen = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        self.screen.keypad(True)
+        curses.curs_set(0)
+        self.setup_ui_handler()
+
+        self.debug_print("Bot started")
 
         return True
 
     def setup_pause_handler(self):
         def key_handler():
-            while True:
-                key = sys.stdin.read(1)
-                if key == 'p':
-                    self.pause = not self.pause
-                    print("Paused" if self.pause else "Resumed")
-                elif key == 'u':
-                    self.should_upgrade_production = not self.should_upgrade_production
-                    print("Upgrading production" if self.should_upgrade_production else "Not upgrading production")
-                elif key == 'q':
-                    sys.exit(0)
-                elif key in ['1', '2', '3']:
-                    self.unit_to_create = int(key)
-                elif key == 's':
-                    print('Gold won so far:', self.gold_won_on_battle)
+            while self.running:
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key == b'p':
+                        self.pause = not self.pause
+                        print("Paused" if self.pause else "Resumed")
+                    elif key == b'u':
+                        self.should_upgrade_production = not self.should_upgrade_production
+                        print("Upgrading production" if self.should_upgrade_production else "Not upgrading production")
+                    elif key == b'q':
+                        self.running = False
+                        print("Quitting...")
+                        sys.exit(0)
+                    elif key in [b'1', b'2', b'3']:
+                        self.unit_to_create = int(key.decode())
+                        print(f"Unit to create set to {self.unit_to_create}")
+                    elif key == b's':
+                        print('Gold won on last battle:', self.gold_won_on_last_battle)
+                    elif key == b'd':
+                        self.debug = not self.debug
+                        print(f"Debug mode {'enabled' if self.debug else 'disabled'}")
+                    elif key == b'n':
+                        self.debug_number_reading()
+                time.sleep(0.1)
 
-        threading.Thread(target=key_handler, daemon=True).start()
+        self.key_handler_thread = threading.Thread(target=key_handler, daemon=True)
+        self.key_handler_thread.start()
+
+    def setup_ui_handler(self):
+        def ui_handler():
+            while self.running:
+                key = self.screen.getch()
+                if key != curses.ERR:  # If a key was pressed
+                    self.handle_key_press(key)
+                    self.draw_ui()  # Redraw UI immediately after key press
+                time.sleep(0.1)
+
+        self.ui_thread = threading.Thread(target=ui_handler, daemon=True)
+        self.ui_thread.start()
+
+        def redraw_ui():
+            while self.running:
+                self.draw_ui()
+                time.sleep(1)  # Redraw every second
+
+        self.redraw_thread = threading.Thread(target=redraw_ui, daemon=True)
+        self.redraw_thread.start()
+
+    def draw_ui(self):
+        self.screen.clear()
+        height, width = self.screen.getmaxyx()
+
+        # Title
+        title = "Game Automation Control Panel"
+        self.screen.addstr(0, (width - len(title)) // 2, title, curses.A_BOLD)
+
+        # Menu items
+        for idx, (item_name, _) in enumerate(self.menu_items):
+            y = idx + 2
+            x = 2
+            if idx == self.selected_menu_item:
+                self.screen.addstr(y, x, f"> {item_name}", curses.A_REVERSE)
+            else:
+                self.screen.addstr(y, x, f"  {item_name}")
+
+        # Unit selection
+        unit_y = len(self.menu_items) + 3
+        self.screen.addstr(unit_y, 2, "Unit to create:")
+        for i in range(1, 4):
+            if i == self.unit_to_create:
+                self.screen.addstr(unit_y, 20 + (i-1)*4, f"[{i}]", curses.A_REVERSE)
+            else:
+                self.screen.addstr(unit_y, 20 + (i-1)*4, f" {i} ")
+
+        # Status information
+        status_y = unit_y + 2
+        self.screen.addstr(status_y, 2, f"Gold held: {self.format_number(self.gold_held)}")
+        self.screen.addstr(status_y + 1, 2, f"Gold won on last battle: {self.format_number(self.gold_won_on_last_battle)}")
+        self.screen.addstr(status_y + 2, 2, f"Upgrade production cost: {self.format_number(self.gold_cost_of_next_upgrade)}")
+        self.screen.addstr(status_y + 3, 2, f"In battle: {'Yes' if self.is_in_battle else 'No'}")
+        self.screen.addstr(status_y + 4, 2, f"Evolve amount: {self.format_number(self.evolve_amount)}")
+        self.screen.addstr(status_y + 5, 2, f"Bot running time: {str(datetime.now() - self.start_time).split('.')[0]}")
+        self.screen.addstr(status_y + 6, 2, f"Is saving to evolve: {'Yes' if self.is_saving_to_evolve else 'No'}")
+
+        # Hotkey information
+        hotkey_y = status_y + 9
+        self.screen.addstr(hotkey_y, 2, "Hotkeys: (P)ause, (D)ebug, (U)pgrade, (Q)uit, (N)umber reading debug")
+
+        self.screen.refresh()
+
+    def handle_key_press(self, key):
+        if key == curses.KEY_UP:
+            self.selected_menu_item = (self.selected_menu_item - 1) % len(self.menu_items)
+        elif key == curses.KEY_DOWN:
+            self.selected_menu_item = (self.selected_menu_item + 1) % len(self.menu_items)
+        elif key == ord('\n') or key == ord(' '):  # Enter or Space
+            _, action = self.menu_items[self.selected_menu_item]
+            action()
+        elif key in [ord('1'), ord('2'), ord('3')]:
+            self.unit_to_create = int(chr(key))
+        elif key in [ord('p'), ord('P')]:
+            self.toggle_pause()
+        elif key in [ord('d'), ord('D')]:
+            self.toggle_debug()
+        elif key in [ord('u'), ord('U')]:
+            self.toggle_upgrade_production()
+        elif key in [ord('q'), ord('Q')]:
+            self.quit_program()
+        elif key in [ord('n'), ord('N')]:  # 'N' for Number reading debug
+            self.debug_number_reading()
+
+    def toggle_upgrade_production(self):
+        self.should_upgrade_production = not self.should_upgrade_production
+        self.menu_items[0] = (f"Upgrade Production: {'ON' if self.should_upgrade_production else 'OFF'}", self.toggle_upgrade_production)
+
+    def toggle_debug(self):
+        self.debug = not self.debug
+        self.menu_items[1] = (f"Debug Mode: {'ON' if self.debug else 'OFF'}", self.toggle_debug)
+        self.debug_print(f"Debug mode {'enabled' if self.debug else 'disabled'}")
+
+    def toggle_pause(self):
+        self.pause = not self.pause
+        self.menu_items[2] = (f"Pause/Resume: {'Paused' if self.pause else 'Running'}", self.toggle_pause)
+
+    def quit_program(self):
+        self.running = False
+        curses.endwin()
+        sys.exit(0)
 
     def screenshot_loop(self):
-        while self.running:
+        while True:
             self.take_screenshot()
             time.sleep(0.02)
 
     def take_screenshot(self):
         if not self.device:
-            print("No device connected")
+            self.debug_print("No device connected")
             return
 
         image = self.device.screencap()
@@ -106,7 +253,7 @@ class GameAutomation:
             self.screenshot_history.append(gray_image)
             
         except IOError as e:
-            print(f"Error writing screenshot: {e}")
+            self.debug_print(f"Error writing screenshot: {e}")
 
     def analyze_image(self, image_name):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -117,7 +264,7 @@ class GameAutomation:
             result = cv.matchTemplate(mat, template, cv.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv.minMaxLoc(result)
 
-            # print(f"[{current_time}] Analyzing image {image_name} - {max_val}")
+            self.debug_print(f"[{current_time}] Analyzing image {image_name} - {max_val}")
 
             match_threshold = 0.7
             if max_val < match_threshold:
@@ -128,28 +275,28 @@ class GameAutomation:
 
             return {'x': center_x, 'y': center_y}
         except Exception as e:
-            print(f"[{current_time}] Error analyzing image: {e}")
+            self.debug_print(f"[{current_time}] Error analyzing image: {e}")
             return None
 
     def touch_screen(self, x, y):
         if not self.device:
-            print("No device connected")
+            self.debug_print("No device connected")
             return
 
         self.device.shell(f"input tap {x} {y}")
 
     def create_unit(self):
         if self.unit_to_create == 1:
-            # print("Creating unit 1")
+            self.debug_print("Creating unit 1")
             self.touch_screen(self.first_troop['x'], self.first_troop['y'])
         elif self.unit_to_create == 2:
-            # print("Creating unit 2")
+            self.debug_print("Creating unit 2")
             self.touch_screen(self.second_troop['x'], self.second_troop['y'])
         elif self.unit_to_create == 3:
-            # print("Creating unit 3")
+            self.debug_print("Creating unit 3")
             self.touch_screen(self.third_troop['x'], self.third_troop['y'])
         else:
-            print(f"Invalid troop number: {self.unit_to_create}. Creating default unit 2")
+            self.debug_print(f"Invalid troop number: {self.unit_to_create}. Creating default unit 2")
             self.touch_screen(self.second_troop['x'], self.second_troop['y'])
             
 
@@ -165,9 +312,12 @@ class GameAutomation:
         if self.start_to_create_units:
             self.create_unit()
 
-        if self.time_of_start_of_battle and (datetime.now() - self.time_of_start_of_battle).total_seconds() > 9:
+        if self.time_of_start_of_battle and (datetime.now() - self.time_of_start_of_battle).total_seconds() > 7.5:
             self.touch_screen(self.first_skill_coords['x'], self.first_skill_coords['y'])
             self.touch_screen(self.second_skill_coords['x'], self.second_skill_coords['y'])
+            self.touch_screen(self.third_skill_coords['x'], self.third_skill_coords['y'])
+            self.touch_screen(self.hero_coords['x'], self.hero_coords['y'])
+
             self.time_of_start_of_battle = None
             self.start_to_create_units = True
 
@@ -182,7 +332,7 @@ class GameAutomation:
         close_battle_button = self.analyze_image('close-battle-button.png')
 
         if close_battle_button:
-            self.gold_won_on_battle += self.read_number_from_screen(self.gold_won_on_battle_region)
+            self.gold_won_on_last_battle = self.read_number_from_screen(self.gold_won_on_battle_region, force_new_screenshot=True)
 
             self.touch_screen(close_battle_button['x'], close_battle_button['y'])
             time.sleep(2)
@@ -193,16 +343,17 @@ class GameAutomation:
 
     def handle_menu_state(self):
         stuck_button = self.analyze_image('are-you-stuck-button.png')
+
         if stuck_button:
             self.touch_screen(stuck_button['x'], stuck_button['y'])
 
         self.upgrade_and_start_battle()
 
     def upgrade_and_start_battle(self):
-        self.gold_held = self.read_number_from_screen(self.gold_region)
+        time.sleep(0.5)
+        self.gold_held = self.read_number_from_screen(self.gold_region, force_new_screenshot=True)
 
-        # if self.should_upgrade_production and self.gold_held >= self.gold_cost_of_next_upgrade:
-        if self.should_upgrade_production:
+        if self.should_upgrade_production and (self.gold_held >= self.gold_cost_of_next_upgrade or self.gold_held == 0 or self.gold_cost_of_next_upgrade == 0 or self.gold_held >= self.evolve_amount):
             self.touch_screen(self.upgrade_menu['x'], self.upgrade_menu['y'])
 
             time.sleep(0.3)
@@ -211,11 +362,20 @@ class GameAutomation:
 
             time.sleep(0.1)
 
+            self.evolve_amount = self.read_number_from_screen(self.evolve_amount_region, force_new_screenshot=True)
+
             self.touch_screen(self.evolve_button['x'], self.evolve_button['y'])
 
             time.sleep(0.3)
 
             self.touch_screen(500, 1900)
+
+            isBuyCoinsModal = self.analyze_image('close_buy_coins.png')
+
+            if isBuyCoinsModal:
+                time.sleep(0.3)
+                self.touch_screen(isBuyCoinsModal['x'], isBuyCoinsModal['y'])
+                isBuyCoinsModal = None
 
             time.sleep(0.1)
 
@@ -223,11 +383,26 @@ class GameAutomation:
 
             time.sleep(0.1)
 
-            self.device.shell(f"input touchscreen swipe {self.upgrade_production['x']} {self.upgrade_production['y']} {self.upgrade_production['x']} {self.upgrade_production['y']} 2000")
+            self.gold_cost_of_next_upgrade = self.read_number_from_screen(self.cost_of_production_region, force_new_screenshot=True)
 
-            self.gold_cost_of_next_upgrade = self.read_number_from_screen(self.cost_of_production_region)
+            time.sleep(0.1)
+            if (self.evolve_amount != 0 and self.gold_won_on_last_battle != 0 and self.evolve_amount / self.gold_won_on_last_battle > 20) or self.gold_cost_of_next_upgrade == 0:
+                self.device.shell(f"input touchscreen swipe {self.upgrade_production['x']} {self.upgrade_production['y']} {self.upgrade_production['x']} {self.upgrade_production['y']} 2000")
 
-            time.sleep(0.3)
+                isBuyCoinsModal = self.analyze_image('close_buy_coins.png')
+
+                if isBuyCoinsModal:
+                    time.sleep(0.3)
+                    self.touch_screen(isBuyCoinsModal['x'], isBuyCoinsModal['y'])
+
+                time.sleep(0.3)
+                self.is_saving_to_evolve = False
+            else:
+                self.is_saving_to_evolve = True
+
+            self.gold_cost_of_next_upgrade = self.read_number_from_screen(self.cost_of_production_region, force_new_screenshot=True)
+        else:
+            self.is_saving_to_evolve = True
 
         buttonToUse = None
 
@@ -244,7 +419,7 @@ class GameAutomation:
 
         # Add a check to ensure buttonToUser is not None
         if buttonToUse is None:
-            print("Could not find battle button")
+            self.debug_print("Could not find battle button")
             return
 
         start_time = time.time()
@@ -256,30 +431,74 @@ class GameAutomation:
         self.time_of_start_of_battle = datetime.now()
         self.start_to_create_units = False
 
-    def read_number_from_screen(self, region=None):
+    def read_number_from_screen(self, region=None, force_new_screenshot=False):
         try:
-            image = Image.open('./screencap.png')
+            if force_new_screenshot:
+                self.take_number_screenshot()
+                time.sleep(0.1)  # Short delay to ensure the screenshot is saved
+
+            image = Image.open('./number_screencap.png')
+            image = image.convert('L')  # Convert to grayscale
+
 
             if region:
                 image = image.crop(region)
+                image.save('cropped_number.png')
 
-            text = pytesseract.image_to_string(image)
+            text = pytesseract.image_to_string(image, lang='eng')
 
-            clean_digits = ''.join(filter(lambda x: x.isdigit() or x == '.', text))
+            print(f"Raw Text: {text}")
+            logging.debug(f"Raw Text: {text}")
+
+            # Remove all non-alphanumeric characters except '.' and spaces
+            cleaned_text = re.sub(r'[^0-9a-zA-Z.\s]', '', text)
+
+            # Split the text into words
+            words = cleaned_text.split()
+
+            # Find the first word that starts with a digit
+            number_word = next((word for word in words if word[0].isdigit()), None)
+
+            if not number_word:
+                return 0
+
+            # Extract only digits and decimal point
+            clean_digits = ''.join(filter(lambda x: x.isdigit() or x == '.', number_word))
+
+            # Handle cases where the decimal point might be misread
+            if clean_digits.count('.') > 1:
+                clean_digits = clean_digits.replace('.', '', clean_digits.count('.') - 1)
 
             amount = float(clean_digits)
 
-            # Check for suffixes in the text
+            print(f"Raw Text: {text}, Cleaned Text: {clean_digits}, Amount: {amount}")
+            logging.debug(f"Raw Text: {text}, Cleaned Text: {clean_digits}, Amount: {amount}")
+
+            # Check for suffixes in the original text
             lower_text = text.lower()
             if 'm' in lower_text:
                 amount *= 1000000
+            elif 'b' in lower_text:
+                amount *= 1000000000
             elif 'k' in lower_text:
                 amount *= 1000
 
             return amount
         except Exception as e:
-            print(f"Error in read_number_from_screen: {e}")
+            self.debug_print(f"Error in read_number_from_screen: {e}")
             return 0
+
+    def take_number_screenshot(self):
+        if not self.device:
+            self.debug_print("No device connected")
+            return
+
+        image = self.device.screencap()
+        try:
+            with open('./number_screencap.png', 'wb') as f:
+                f.write(image)
+        except IOError as e:
+            self.debug_print(f"Error writing number screenshot: {e}")
 
     def check_if_stuck(self):
         if len(self.screenshot_history) < self.min_stuck_screenshots:
@@ -296,77 +515,100 @@ class GameAutomation:
                 break
 
         if similar_count >= self.min_stuck_screenshots - 1:
-            print(f"Detected stuck state ({similar_count + 1} similar screenshots). Restarting bot.")
-            self.restart_bot()
+            self.debug_print(f"Detected stuck state ({similar_count + 1} similar screenshots). Restarting bot.")
             return True
+
+        self.screenshot_history.clear()
 
         return False
 
-    def restart_bot(self):
-        print("Restarting the bot...")
-        self.running = False
+    def debug_print(self, message):
+        if self.debug:
+            logging.debug(message)
 
-        self.restart_adb_application()
+    def format_number(self, number):
+        return f"{number:,.2f}"
 
-        new_bot = GameAutomation(self.unit_to_create, self.should_upgrade_production)
-        if new_bot.initialize():
-            new_bot.run()
+    def debug_number_reading(self):
+        self.pause = True
+        selected_option = 0
+        options = [
+            ("Gold Held", self.gold_region),
+            ("Gold Won on Battle", self.gold_won_on_battle_region),
+            ("Gold Cost of Next Upgrade", self.cost_of_production_region),
+            ("Evolve Amount", self.evolve_amount_region)
+        ]
 
-    def restart_adb_application(self):
-        if not self.device:
-            print("No device connected")
-            return
+        while True:
+            self.screen.clear()
+            self.screen.addstr(0, 0, "Debug Number Reading")
+            for i, (label, _) in enumerate(options):
+                if i == selected_option:
+                    self.screen.addstr(i+2, 0, f"> {label}", curses.A_REVERSE)
+                else:
+                    self.screen.addstr(i+2, 0, f"  {label}")
+            self.screen.addstr(len(options)+3, 0, "Use arrow keys to select, Enter to debug, or any other key to return")
+            self.screen.refresh()
 
-        package_name = "com.vjsjlqvlmp.wearewarriors"  # Replace with the actual package name of your game
+            key = self.screen.getch()
+            if key == curses.KEY_UP:
+                selected_option = (selected_option - 1) % len(options)
+            elif key == curses.KEY_DOWN:
+                selected_option = (selected_option + 1) % len(options)
+            elif key == ord('\n'):  # Enter key
+                label, region = options[selected_option]
+                self.debug_selected_number(label, region)
+            else:
+                break
 
-        print(f"Stopping {package_name}...")
-        self.device.shell(f"am force-stop {package_name}")
-        time.sleep(2)  # Wait for the app to fully stop
+    def debug_selected_number(self, label, region):
+        self.screen.clear()
+        self.take_number_screenshot()
+        number = self.read_number_from_screen(region)
+        
+        image = cv2.imread('./number_screencap.png')
+        x, y, w, h = region
+        cv2.rectangle(image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.imwrite('./debug_number_screenshot.png', image)
 
-        print(f"Starting {package_name}...")
-        self.device.shell(f"monkey -p {package_name} -c android.intent.category.LAUNCHER 1")
-        time.sleep(10)  # Wait for the app to fully start
+        self.screen.addstr(0, 0, f"Debugging {label}")
+        self.screen.addstr(2, 0, f"Detected number: {self.format_number(number)}")
+        self.screen.addstr(4, 0, "A debug screenshot has been saved as 'debug_number_screenshot.png'")
+        self.screen.addstr(5, 0, "Press any key to continue")
+        self.screen.refresh()
+        self.screen.getch()
 
-        self.touch_screen(self.enter_event_button['x'], self.enter_event_button['y'])
-
-        print("Application restarted.")
+    def setup_logging(self):
+        logging.basicConfig(filename='debug.log', level=logging.DEBUG, 
+                            format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
     def run(self):
         while self.running:
-            if self.pause:
-                continue
+            if not self.pause:
+                self.loop_count += 1
+                self.is_in_battle = self.check_if_is_in_battle()
 
-            if self.check_if_stuck():
-                break
+                self.debug_print(f"Loop {self.loop_count}: In battle: {self.is_in_battle}, Gold: {self.gold_held}")
 
-            # Check if an hour has passed
-            if datetime.now() - self.start_time > timedelta(hours=1):
-                print("An hour has passed. Restarting the bot...")
-                self.restart_bot()
-                break
+                if self.is_in_battle:
+                    self.handle_battle_state()
+                    continue
 
-            self.gold_held = self.read_number_from_screen(self.gold_region)
+                is_on_menu = self.check_if_is_on_menu()
 
-            self.loop_count += 1
-            self.is_in_battle = self.check_if_is_in_battle()
+                if is_on_menu:
+                    self.handle_menu_state()
+                else:
+                    self.is_in_battle = True
+                    self.touch_screen(500, 1900)
+                    close_battle_button = self.analyze_image('close-battle-button.png')
 
-            if self.is_in_battle:
-                self.handle_battle_state()
-                continue
+                    if close_battle_button:
+                        self.exit_battle()
 
-            is_on_menu = self.check_if_is_on_menu()
+            time.sleep(0.1)
 
-
-            if is_on_menu:
-                self.handle_menu_state()
-            else:
-                self.is_in_battle = True
-                self.touch_screen(500, 1900)
-                close_battle_button = self.analyze_image('close-battle-button.png')
-
-                if close_battle_button:
-                    self.exit_battle()
-
+        curses.endwin()
         print("Bot instance stopped.")
 
 if __name__ == "__main__":
@@ -375,4 +617,5 @@ if __name__ == "__main__":
         if game_automation.initialize():
             game_automation.run()
     except Exception as e:
+        curses.endwin()
         print(e)
